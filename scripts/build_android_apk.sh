@@ -80,7 +80,7 @@ fi
   --min-sdk-version 24 \
   --target-sdk-version 24 \
   --version-code 1 \
-  --version-name 0.2.10 \
+  --version-name 1.70 \
   -A "${ASSETS_DIR}" \
   --java "${OUT_DIR}/gen" \
   "${OUT_DIR}/compiled-res.zip"
