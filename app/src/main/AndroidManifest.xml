@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.supercell.magic">
+    <uses-feature
+        android:glEsVersion="0x00020000"
+        android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hasCode="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Clash of Clans"
+        android:theme="@style/AppTheme">
+        <activity
+            android:name=".ClashNativeActivity"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustNothing">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="g" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
