@@ -169,7 +169,7 @@ sdkmanager "ndk;27.2.12479018"
 
 export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
 
-cd ~/SpookyPopEmulator-linux
+cd ~/ClashofClansEmulator
 ./scripts/build_android_apk.sh
 ```
 
