@@ -42,6 +42,8 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -50,7 +52,6 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <fcntl.h>
 #endif
 
 #include <zlib.h>
@@ -58,6 +59,8 @@
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb/stb_truetype.h"
+
+struct RuntimeState;
 
 namespace {
 
@@ -1202,22 +1205,184 @@ private:
 };
 #endif
 
+namespace {
+    using ALenum = unsigned int;
+    using ALsizei = int;
+    using ALuint = unsigned int;
+    using ALint = int;
+    using ALCboolean = int;
+    using ALCenum = int;
+    using ALCint = int;
+    using ALCdevice = struct ALCdevice_struct;
+    using ALCcontext = struct ALCcontext_struct;
+
+    struct OpenAlRuntime {
+        void* library = nullptr;
+        ALCdevice* (*alcOpenDevice)(const char*) = nullptr;
+        ALCcontext* (*alcCreateContext)(ALCdevice*, const ALCint*) = nullptr;
+        ALCboolean (*alcMakeContextCurrent)(ALCcontext*) = nullptr;
+        void (*alcDestroyContext)(ALCcontext*) = nullptr;
+        void (*alcCloseDevice)(ALCdevice*) = nullptr;
+        void (*alGenBuffers)(ALsizei, ALuint*) = nullptr;
+        void (*alDeleteBuffers)(ALsizei, const ALuint*) = nullptr;
+        void (*alBufferData)(ALuint, ALenum, const void*, ALsizei, ALsizei) = nullptr;
+        void (*alGenSources)(ALsizei, ALuint*) = nullptr;
+        void (*alDeleteSources)(ALsizei, const ALuint*) = nullptr;
+        void (*alSourcei)(ALuint, ALenum, ALint) = nullptr;
+        void (*alSourcePlay)(ALuint) = nullptr;
+        void (*alSourceStop)(ALuint) = nullptr;
+    };
+
+    OpenAlRuntime& GetLinuxOpenAlRuntime() {
+        static OpenAlRuntime runtime;
+        if (runtime.library == nullptr) {
+            runtime.library = dlopen("libopenal.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (runtime.library == nullptr) {
+                runtime.library = dlopen("libopenal.so", RTLD_LAZY | RTLD_LOCAL);
+            }
+            if (runtime.library == nullptr) {
+                return runtime;
+            }
+
+            runtime.alcOpenDevice = reinterpret_cast<ALCdevice* (*)(const char*)>(dlsym(runtime.library, "alcOpenDevice"));
+            runtime.alcCreateContext = reinterpret_cast<ALCcontext* (*)(ALCdevice*, const ALCint*)>(dlsym(runtime.library, "alcCreateContext"));
+            runtime.alcMakeContextCurrent = reinterpret_cast<ALCboolean (*)(ALCcontext*)>(dlsym(runtime.library, "alcMakeContextCurrent"));
+            runtime.alcDestroyContext = reinterpret_cast<void (*)(ALCcontext*)>(dlsym(runtime.library, "alcDestroyContext"));
+            runtime.alcCloseDevice = reinterpret_cast<void (*)(ALCdevice*)>(dlsym(runtime.library, "alcCloseDevice"));
+            runtime.alGenBuffers = reinterpret_cast<void (*)(ALsizei, ALuint*)>(dlsym(runtime.library, "alGenBuffers"));
+            runtime.alDeleteBuffers = reinterpret_cast<void (*)(ALsizei, const ALuint*)>(dlsym(runtime.library, "alDeleteBuffers"));
+            runtime.alBufferData = reinterpret_cast<void (*)(ALuint, ALenum, const void*, ALsizei, ALsizei)>(dlsym(runtime.library, "alBufferData"));
+            runtime.alGenSources = reinterpret_cast<void (*)(ALsizei, ALuint*)>(dlsym(runtime.library, "alGenSources"));
+            runtime.alDeleteSources = reinterpret_cast<void (*)(ALsizei, const ALuint*)>(dlsym(runtime.library, "alDeleteSources"));
+            runtime.alSourcei = reinterpret_cast<void (*)(ALuint, ALenum, ALint)>(dlsym(runtime.library, "alSourcei"));
+            runtime.alSourcePlay = reinterpret_cast<void (*)(ALuint)>(dlsym(runtime.library, "alSourcePlay"));
+            runtime.alSourceStop = reinterpret_cast<void (*)(ALuint)>(dlsym(runtime.library, "alSourceStop"));
+        }
+        return runtime;
+    }
+}
+
+std::string Lowercase(std::string value);
+
 void PlayHostAudio(std::vector<u8> pcm, const u32 format, const u32 frequency) {
 #if defined(__ANDROID__)
     AndroidAudioPlayer::Instance().Play(std::move(pcm), format, frequency);
 #else
-    (void)pcm;
-    (void)format;
-    (void)frequency;
+    auto& runtime = GetLinuxOpenAlRuntime();
+    if (runtime.library == nullptr || runtime.alcOpenDevice == nullptr || runtime.alcCreateContext == nullptr
+        || runtime.alcMakeContextCurrent == nullptr || runtime.alGenBuffers == nullptr || runtime.alBufferData == nullptr
+        || runtime.alGenSources == nullptr || runtime.alSourcei == nullptr || runtime.alSourcePlay == nullptr) {
+        return;
+    }
+
+    ALCdevice* device = runtime.alcOpenDevice(nullptr);
+    if (device == nullptr) {
+        return;
+    }
+    ALCcontext* context = runtime.alcCreateContext(device, nullptr);
+    if (context == nullptr) {
+        runtime.alcCloseDevice(device);
+        return;
+    }
+    if (runtime.alcMakeContextCurrent(context) == 0) {
+        runtime.alcDestroyContext(context);
+        runtime.alcCloseDevice(device);
+        return;
+    }
+
+    ALuint buffer = 0;
+    runtime.alGenBuffers(1, &buffer);
+    if (pcm.empty()) {
+        runtime.alDeleteBuffers(1, &buffer);
+        runtime.alcMakeContextCurrent(nullptr);
+        runtime.alcDestroyContext(context);
+        runtime.alcCloseDevice(device);
+        return;
+    }
+    runtime.alBufferData(buffer, static_cast<ALenum>(format), pcm.data(), static_cast<ALsizei>(pcm.size()), static_cast<ALsizei>(frequency));
+
+    ALuint source = 0;
+    runtime.alGenSources(1, &source);
+    runtime.alSourcei(source, 0x1009, static_cast<ALint>(buffer));
+    runtime.alSourcei(source, 0x1007, 0);
+    runtime.alSourcePlay(source);
+
+    const auto source_format = DecodeAlFormat(format);
+    const u64 duration_ms = source_format == std::nullopt
+        ? 250u
+        : std::max<u64>(HostAudioDurationMs(pcm.size(), *source_format, frequency), 250u);
+
+    std::thread cleanup([&runtime, buffer, source, context, device, duration_ms]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms + 50u));
+        runtime.alSourceStop(source);
+        runtime.alDeleteSources(1, &source);
+        runtime.alDeleteBuffers(1, &buffer);
+        runtime.alcMakeContextCurrent(nullptr);
+        runtime.alcDestroyContext(context);
+        runtime.alcCloseDevice(device);
+    });
+    cleanup.detach();
 #endif
+}
+
+static std::string EscapeShellArg(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('\'');
+    for (const char ch : value) {
+        if (ch == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    escaped.push_back('\'');
+    return escaped;
 }
 
 bool PlayHostAudioFile(const std::filesystem::path& path) {
 #if defined(__ANDROID__)
     return AndroidAudioPlayer::Instance().PlayFile(path);
 #else
-    (void)path;
-    return false;
+    if (path.empty() || !std::filesystem::exists(path)) {
+        return false;
+    }
+    const auto raw = ReadFileBytes(path);
+    if (raw) {
+        const auto decoded = DecodeAudioBytes(*raw);
+        if (decoded) {
+            PlayHostAudio(decoded->pcm, decoded->format, decoded->frequency);
+            return true;
+        }
+    }
+
+    const std::string lower = Lowercase(path.extension().string());
+    if (lower != ".mp3" && lower != ".m4a" && lower != ".aac" && lower != ".ogg" && lower != ".caf" && lower != ".wav") {
+        return false;
+    }
+
+    const std::string command = "ffmpeg -v error -i " + EscapeShellArg(path.string()) + " -f s16le -ar 44100 -ac 2 -";
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) {
+        return false;
+    }
+
+    std::vector<u8> pcm;
+    std::array<char, 8192> buffer{};
+    while (!std::feof(pipe)) {
+        const std::size_t read = std::fread(buffer.data(), 1, buffer.size(), pipe);
+        if (read == 0) {
+            break;
+        }
+        pcm.insert(pcm.end(), buffer.data(), buffer.data() + read);
+    }
+    const int rc = pclose(pipe);
+    if (rc != 0 || pcm.empty()) {
+        return false;
+    }
+
+    PlayHostAudio(pcm, 0x1103u, 44100);
+    return true;
 #endif
 }
 
@@ -1561,6 +1726,7 @@ int CloseNativeSocket(const NativeSocket socket) {
 int HostSocketErrno() {
     return errno;
 }
+
 #endif
 
 template<typename Fn>
@@ -1795,6 +1961,7 @@ struct RuntimeState {
         std::vector<u32> buffers;
         std::unordered_map<u32, float> parameters;
         std::unordered_map<u32, std::vector<u8>> properties;
+        std::filesystem::path current_path;
         u32 callback = 0;
         u32 callback_user_data = 0;
     };
@@ -1893,7 +2060,13 @@ struct RuntimeState {
         int family = 0;
         int type = 0;
         int protocol = 0;
+        int flags = 0;
+        bool connected = false;
+        bool local_redirect = false;
+        std::vector<u8> pending_recv;
     };
+
+    NativeSocket local_server = kInvalidNativeSocket;
 
     struct DisplayLink {
         u32 object = 0;
@@ -2001,6 +2174,10 @@ struct RuntimeState {
     std::unordered_map<u32, u32> sqlite_stmt_to_db;  // stmt guest → db guest
 
     ~RuntimeState() {
+        if (local_server != kInvalidNativeSocket) {
+            ::close(local_server);
+            local_server = kInvalidNativeSocket;
+        }
         for (auto& [_, stmt] : sqlite_stmts) {
             if (stmt != nullptr) {
                 sqlite3_finalize(stmt);
@@ -2013,6 +2190,63 @@ struct RuntimeState {
         }
     }
 };
+
+namespace {
+
+void AcceptLoopbackConnections(const NativeSocket listener) {
+    for (;;) {
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
+        const NativeSocket client = ::accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+        if (client == kInvalidNativeSocket) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+
+        const char reply[] = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        (void)::send(client, reply, sizeof(reply) - 1, 0);
+        ::shutdown(client, SHUT_RDWR);
+        ::close(client);
+    }
+}
+
+}  // namespace
+
+bool EnsureLoopbackServerSocket(RuntimeState& runtime, const u16 port = 9339) {
+    if (runtime.local_server != kInvalidNativeSocket) {
+        return true;
+    }
+
+    const NativeSocket listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == kInvalidNativeSocket) {
+        return false;
+    }
+
+    int reuse_addr = 1;
+    if (::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) != 0) {
+        ::close(listener);
+        return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(listener);
+        return false;
+    }
+    if (::listen(listener, 8) != 0) {
+        ::close(listener);
+        return false;
+    }
+
+    runtime.local_server = listener;
+    std::thread(AcceptLoopbackConnections, listener).detach();
+    return true;
+}
 
 Emulator::Emulator(EmulatorOptions options)
     : binary_path_(ResolveBinaryPath(options.binary_path, options.external_root))
@@ -2048,7 +2282,7 @@ Emulator::Emulator(EmulatorOptions options)
     InstallGuestFastPaths();
     memory_.SetWriteProtection(true);
     ApplyGuestLogicVersionPatches();
-    //ApplyGuestLogicDefinesPatches();
+    ApplyGuestLogicDefinesPatches();
     BuildProcessState();
 }
 
@@ -2076,6 +2310,7 @@ int Emulator::Run(const bool run_initializers, const bool run_main, const std::u
     if (run_initializers) {
         for (const u32 init : image_.init_functions()) {
             returned_from_guest_ = false;
+            std::lock_guard lock(cpu_execution_mutex_);
             cpu_->Regs().fill(0);
             cpu_->Regs()[13] = stack_pointer_;
             cpu_->Regs()[14] = return_stub_;
@@ -2112,6 +2347,7 @@ int Emulator::Run(const bool run_initializers, const bool run_main, const std::u
 
     if (run_main) {
         returned_from_guest_ = false;
+        std::lock_guard lock(cpu_execution_mutex_);
         cpu_->Regs().fill(0);
         cpu_->Regs()[13] = stack_pointer_;
         cpu_->Regs()[14] = return_stub_;
@@ -2150,6 +2386,54 @@ int Emulator::Run(const bool run_initializers, const bool run_main, const std::u
     }
 
     return exit_code_;
+}
+
+void Emulator::RunGuestThread(const u32 start_routine, const u32 arg, const u32 thread_id) {
+    std::lock_guard lock(cpu_execution_mutex_);
+    cpu_->Regs().fill(0);
+    cpu_->Regs()[0] = arg;
+    cpu_->Regs()[13] = stack_pointer_;
+    cpu_->Regs()[14] = return_stub_;
+    cpu_->Regs()[15] = start_routine & ~1u;
+    cpu_->SetCpsr((start_routine & 1u) != 0 ? 0x30 : 0x10);
+
+    if (libc_abi_ != nullptr) {
+        const auto it = libc_abi_->threads_.find(thread_id);
+        if (it != libc_abi_->threads_.end()) {
+            it->second.finished = false;
+        }
+    }
+
+    while (true) {
+        if (!BeginTickSlice()) {
+            break;
+        }
+        const Dynarmic::HaltReason halt = cpu_->Run();
+        if (returned_from_guest_ || Dynarmic::Has(halt, Dynarmic::HaltReason::UserDefined1)
+            || Dynarmic::Has(halt, Dynarmic::HaltReason::UserDefined2)) {
+            break;
+        }
+        if (ticks_left_ == 0) {
+            if (total_ticks_left_ == 0) {
+                break;
+            }
+            continue;
+        }
+        if (Dynarmic::Has(halt, Dynarmic::HaltReason::UserDefined5)) {
+            break;
+        }
+        break;
+    }
+
+    if (libc_abi_ != nullptr) {
+        const auto it = libc_abi_->threads_.find(thread_id);
+        if (it != libc_abi_->threads_.end()) {
+            it->second.finished = true;
+            it->second.return_value = cpu_->Regs()[0];
+            memory_.Write32(thread_id + 20, 1);
+            memory_.Write32(thread_id + 24, it->second.return_value);
+        }
+    }
 }
 
 std::optional<std::uint32_t> Emulator::MemoryReadCode(const Dynarmic::A32::VAddr vaddr) {
@@ -2382,7 +2666,7 @@ void Emulator::BuildImage() {
     });
 
     // Force LogicDefines::OFFLINE_MODE on so we can bypass the server path for now.
-    memory_.Write8(0x1FBCF4, 1);
+    memory_.Write8(0x1FBCF4, 1); // LogicDefines::OFFLINE_MODE
     // memory_.Write8(kGuestResourceManagerLazyLoadingEnabled, 1);
 }
 
@@ -3965,7 +4249,7 @@ void Emulator::ApplyGuestLogicVersionPatches() {
 void Emulator::ApplyGuestLogicDefinesPatches() {
     ApplyGuestForcedBoolReturn(kGuestLogicDefinesIsPlatformAndroid, true, "LogicDefines::isPlatformAndroid");
     ApplyGuestForcedBoolReturn(kGuestLogicDefinesIsPlatformIOS, false, "LogicDefines::isPlatformIOS");
-    ApplyGuestForcedBoolReturn(kGameSettingsIsMusicEnabled, false, "GameSettings::isMusicEnabled");
+    ApplyGuestForcedBoolReturn(kGameSettingsIsMusicEnabled, true, "GameSettings::isMusicEnabled");
 }
 
 std::filesystem::path Emulator::IapWarningStatePath() const {
@@ -7711,6 +7995,10 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
             .family = static_cast<int>(Arg(0)),
             .type = static_cast<int>(Arg(1)),
             .protocol = static_cast<int>(Arg(2)),
+            .flags = 0,
+            .connected = false,
+            .local_redirect = false,
+            .pending_recv = {},
         };
         return guest_fd;
     }
@@ -7721,13 +8009,59 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
             return static_cast<u32>(-1);
         }
         auto sockaddr_bytes = memory_.ReadBuffer(Arg(1), Arg(2));
+        bool is_local_redirect = false;
+        if (sockaddr_bytes.size() >= sizeof(sockaddr_in)) {
+            sockaddr_in sin{};
+            std::memcpy(&sin, sockaddr_bytes.data(), sizeof(sin));
+            char host[INET_ADDRSTRLEN] = {};
+            if (sin.sin_family == AF_INET && ::inet_ntop(AF_INET, &sin.sin_addr, host, sizeof(host)) != nullptr) {
+                is_local_redirect = std::string(host) == "127.0.0.1" && ntohs(sin.sin_port) == 9339;
+                if (is_local_redirect) {
+                    EnsureLoopbackServerSocket(*runtime_);
+                }
+            }
+        }
+        if (is_local_redirect) {
+            EnsureLoopbackServerSocket(*runtime_);
+            if (it->second.socket != kInvalidNativeSocket) {
+                const int result = ::connect(it->second.socket, reinterpret_cast<const sockaddr*>(sockaddr_bytes.data()), static_cast<socklen_t>(Arg(2)));
+                if (result != 0 && errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    const int err = HostSocketErrno();
+                    if (runtime_->debug_net_logs < 128) {
+                        ++runtime_->debug_net_logs;
+                        Log("[net] connect fd=" + std::to_string(Arg(0)) + " loopback host_connect errno=" + std::to_string(err));
+                    }
+                }
+            }
+            it->second.connected = true;
+            it->second.local_redirect = true;
+            if (it->second.pending_recv.empty()) {
+                static constexpr char kRedirectGreeting[] = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                it->second.pending_recv.assign(kRedirectGreeting, kRedirectGreeting + sizeof(kRedirectGreeting) - 1);
+            }
+            SetErrno(0);
+            if (runtime_->debug_net_logs < 128) {
+                ++runtime_->debug_net_logs;
+                Log("[net] connect fd=" + std::to_string(Arg(0)) + " endpoint=127.0.0.1:9339 redirected local stub result=0");
+            }
+            return 0;
+        }
         const int result = ::connect(it->second.socket, reinterpret_cast<const sockaddr*>(sockaddr_bytes.data()), static_cast<socklen_t>(Arg(2)));
         if (result != 0) {
-            SetErrno(HostSocketErrno());
+            const int err = HostSocketErrno();
+            if (err == EINPROGRESS || err == EAGAIN || err == EWOULDBLOCK) {
+                if (runtime_->debug_net_logs < 128) {
+                    ++runtime_->debug_net_logs;
+                    Log("[net] connect fd=" + std::to_string(Arg(0)) + " pending errno=" + std::to_string(err));
+                }
+                SetErrno(err);
+                return static_cast<u32>(-1);
+            }
+            SetErrno(err);
             if (runtime_->debug_net_logs < 128) {
                 ++runtime_->debug_net_logs;
                 Log("[net] connect fd=" + std::to_string(Arg(0))
-                    + " result=-1 errno=" + std::to_string(HostSocketErrno()));
+                    + " result=-1 errno=" + std::to_string(err));
             }
             return static_cast<u32>(-1);
         }
@@ -7757,6 +8091,18 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
             return static_cast<u32>(-1);
         }
         const auto bytes = memory_.ReadBuffer(Arg(1), Arg(2));
+        if (it->second.local_redirect) {
+            if (!bytes.empty()) {
+                it->second.pending_recv.insert(it->second.pending_recv.end(), bytes.begin(), bytes.end());
+            }
+            SetErrno(0);
+            if (runtime_->debug_net_logs < 256) {
+                ++runtime_->debug_net_logs;
+                Log("[net] send fd=" + std::to_string(Arg(0))
+                    + " local_redirect result=" + std::to_string(bytes.size()));
+            }
+            return static_cast<u32>(bytes.size());
+        }
         const auto sent = ::send(it->second.socket, reinterpret_cast<const char*>(bytes.data()), static_cast<int>(bytes.size()), static_cast<int>(Arg(3)));
         if (sent < 0) {
             SetErrno(HostSocketErrno());
@@ -7783,6 +8129,29 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
             return static_cast<u32>(-1);
         }
         std::vector<u8> bytes(Arg(2));
+        if (it->second.local_redirect) {
+            const std::size_t available = it->second.pending_recv.size();
+            if (available == 0) {
+                SetErrno(EAGAIN);
+                if (runtime_->debug_net_logs < 256) {
+                    ++runtime_->debug_net_logs;
+                    Log("[net] recv fd=" + std::to_string(Arg(0)) + " local_redirect result=0 wouldblock");
+                }
+                return 0;
+            }
+            const std::size_t to_copy = std::min<std::size_t>(bytes.size(), available);
+            std::memcpy(bytes.data(), it->second.pending_recv.data(), to_copy);
+            it->second.pending_recv.erase(it->second.pending_recv.begin(), it->second.pending_recv.begin() + static_cast<std::ptrdiff_t>(to_copy));
+            memory_.WriteBuffer(Arg(1), std::span<const u8>(bytes.data(), to_copy));
+            SetErrno(0);
+            if (runtime_->debug_net_logs < 256) {
+                ++runtime_->debug_net_logs;
+                Log("[net] recv fd=" + std::to_string(Arg(0))
+                    + " local_redirect result=" + std::to_string(to_copy)
+                    + " " + DescribePiranhaPacket(std::span<const u8>(bytes.data(), to_copy)));
+            }
+            return static_cast<u32>(to_copy);
+        }
         const auto received = ::recv(it->second.socket, reinterpret_cast<char*>(bytes.data()), static_cast<int>(bytes.size()), static_cast<int>(Arg(3)));
         if (received < 0) {
             SetErrno(HostSocketErrno());
@@ -7837,8 +8206,8 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
         }
         const u32 first = runtime_->next_socket_fd++;
         const u32 second = runtime_->next_socket_fd++;
-        runtime_->sockets[first] = RuntimeState::SocketHandle{pair[0], static_cast<int>(Arg(0)), static_cast<int>(Arg(1)), static_cast<int>(Arg(2))};
-        runtime_->sockets[second] = RuntimeState::SocketHandle{pair[1], static_cast<int>(Arg(0)), static_cast<int>(Arg(1)), static_cast<int>(Arg(2))};
+        runtime_->sockets[first] = RuntimeState::SocketHandle{pair[0], static_cast<int>(Arg(0)), static_cast<int>(Arg(1)), static_cast<int>(Arg(2)), 0};
+        runtime_->sockets[second] = RuntimeState::SocketHandle{pair[1], static_cast<int>(Arg(0)), static_cast<int>(Arg(1)), static_cast<int>(Arg(2)), 0};
         memory_.Write32(Arg(3), first);
         memory_.Write32(Arg(3) + 4, second);
         return 0;
@@ -7857,6 +8226,63 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
         addrinfo* results = nullptr;
         const std::string node = Arg(0) == 0 ? std::string{} : ReadGuestCString(Arg(0));
         const std::string service = Arg(1) == 0 ? std::string{} : ReadGuestCString(Arg(1));
+        const std::string lower_node = Lowercase(node);
+
+        const bool redirect_host = lower_node == "game.clashofclans.com"
+            || lower_node == "gamea.clashofclans.com"
+            || lower_node.find("clashofclans.com") != std::string::npos;
+        const std::string new_redirect_ip = "127.0.0.1";
+        const u16 redirect_port = 9339;
+
+        if (redirect_host) {
+            const int family = AF_INET;
+            const int socktype = hint_ptr != nullptr && hints.ai_socktype != 0 ? hints.ai_socktype : SOCK_STREAM;
+            const int protocol = hint_ptr != nullptr && hints.ai_protocol != 0 ? hints.ai_protocol : IPPROTO_TCP;
+            u16 port = redirect_port;
+            if (!service.empty()) {
+                char* end = nullptr;
+                const unsigned long parsed = std::strtoul(service.c_str(), &end, 10);
+                if (end != service.c_str() && *end == '\0' && parsed <= 65535UL && parsed != 0UL) {
+                    port = static_cast<u16>(parsed);
+                }
+            }
+            if (service.empty() || service == "9339" || service == "9339\0") {
+                port = redirect_port;
+            }
+            if (service.find(':') != std::string::npos) {
+                const std::string maybe_port = service.substr(service.find_last_of(':') + 1);
+                char* end = nullptr;
+                const unsigned long parsed = std::strtoul(maybe_port.c_str(), &end, 10);
+                if (end != maybe_port.c_str() && *end == '\0' && parsed <= 65535UL && parsed != 0UL) {
+                    port = static_cast<u16>(parsed);
+                }
+            }
+            EnsureLoopbackServerSocket(*runtime_, port);
+
+            sockaddr_in sin{};
+            sin.sin_family = AF_INET;
+            sin.sin_port = htons(port);
+            const int aton_result = ::inet_pton(AF_INET, new_redirect_ip.c_str(), &sin.sin_addr);
+            if (aton_result != 1) {
+                SetErrno(EINVAL);
+                return static_cast<u32>(-1);
+            }
+
+            const u32 node_addr = AllocateData(32, 4, "addrinfo");
+            const u32 sockaddr_addr = AllocateData(sizeof(sockaddr_in), 4, "sockaddr");
+            memory_.WriteBuffer(sockaddr_addr, std::span<const u8>(reinterpret_cast<const u8*>(&sin), sizeof(sin)));
+            memory_.Write32(node_addr + 0, 0);
+            memory_.Write32(node_addr + 4, static_cast<u32>(family));
+            memory_.Write32(node_addr + 8, static_cast<u32>(socktype));
+            memory_.Write32(node_addr + 12, static_cast<u32>(protocol));
+            memory_.Write32(node_addr + 16, sizeof(sockaddr_in));
+            memory_.Write32(node_addr + 20, 0);
+            memory_.Write32(node_addr + 24, sockaddr_addr);
+            memory_.Write32(node_addr + 28, 0);
+            memory_.Write32(Arg(3), node_addr);
+            return 0;
+        }
+
         const int result = ::getaddrinfo(node.empty() ? nullptr : node.c_str(), service.empty() ? nullptr : service.c_str(), hint_ptr, &results);
         if (result != 0) {
             SetErrno(result);
@@ -7984,7 +8410,29 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
         return static_cast<u32>(libc_abi_->CloseFile(guest_file) == 0 ? 0 : -1);
     }
     if (name == "_fcntl") {
-        return 0;
+        const auto socket_it = runtime_->sockets.find(Arg(0));
+        if (socket_it == runtime_->sockets.end()) {
+            return 0;
+        }
+        const int command = static_cast<int>(Arg(1));
+        const int value = static_cast<int>(Arg(2));
+        switch (command) {
+#if !defined(_WIN32)
+        case F_GETFL:
+            return static_cast<u32>(socket_it->second.flags);
+        case F_SETFL:
+            socket_it->second.flags = value;
+            if ((value & O_NONBLOCK) != 0) {
+                const int host_flags = ::fcntl(socket_it->second.socket, F_GETFL, 0);
+                if (host_flags >= 0) {
+                    ::fcntl(socket_it->second.socket, F_SETFL, host_flags | O_NONBLOCK);
+                }
+            }
+            return 0;
+#endif
+        default:
+            return 0;
+        }
     }
     if (name == "_pthread_mutex_init" || name == "_pthread_mutex_destroy" || name == "_pthread_mutex_lock" || name == "_pthread_mutex_unlock") {
         if (name == "_pthread_mutex_init") {
@@ -8104,7 +8552,150 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
         return 0;
     }
     if (name == "_select$DARWIN_EXTSN") {
-        return 0;
+        const int nfds = static_cast<int>(Arg(0));
+
+        const auto guest_bit = [&](u32 set_ptr, u32 guest_fd) {
+            if (set_ptr == 0 || guest_fd >= static_cast<u32>(nfds)) {
+                return false;
+            }
+            const u32 word = guest_fd / 32u;
+            const u32 bit = 1u << (guest_fd % 32u);
+            return (memory_.Read32(set_ptr + word * 4u) & bit) != 0u;
+        };
+
+        const auto write_guest_bits = [&](u32 set_ptr, const fd_set& host_set) {
+            if (set_ptr == 0) {
+                return;
+            }
+            std::vector<u32> words((std::max<int>(1, nfds) + 31) / 32, 0u);
+            for (const auto& [guest_fd, handle] : runtime_->sockets) {
+                if (guest_fd >= static_cast<u32>(nfds)) {
+                    continue;
+                }
+                if (FD_ISSET(handle.socket, &host_set)) {
+                    words[guest_fd / 32u] |= (1u << (guest_fd % 32u));
+                }
+            }
+            for (u32 i = 0; i < words.size(); ++i) {
+                memory_.Write32(set_ptr + i * 4u, words[i]);
+            }
+        };
+
+        fd_set read_set{};
+        fd_set write_set{};
+        fd_set except_set{};
+        FD_ZERO(&read_set);
+        FD_ZERO(&write_set);
+        FD_ZERO(&except_set);
+
+        int max_host_fd = -1;
+        int local_ready_count = 0;
+        for (const auto& [guest_fd, handle] : runtime_->sockets) {
+            if (guest_fd >= static_cast<u32>(nfds)) {
+                continue;
+            }
+            if (handle.local_redirect && handle.connected) {
+                const bool want_read = guest_bit(Arg(1), guest_fd) || !handle.pending_recv.empty();
+                const bool want_write = guest_bit(Arg(2), guest_fd) || handle.connected;
+                const bool want_except = guest_bit(Arg(3), guest_fd);
+                if (want_read) {
+                    ++local_ready_count;
+                    if (Arg(1) != 0) {
+                        const u32 word = guest_fd / 32u;
+                        const u32 bit = 1u << (guest_fd % 32u);
+                        memory_.Write32(Arg(1) + word * 4u, memory_.Read32(Arg(1) + word * 4u) | bit);
+                    }
+                }
+                if (want_write) {
+                    ++local_ready_count;
+                    if (Arg(2) != 0) {
+                        const u32 word = guest_fd / 32u;
+                        const u32 bit = 1u << (guest_fd % 32u);
+                        memory_.Write32(Arg(2) + word * 4u, memory_.Read32(Arg(2) + word * 4u) | bit);
+                    }
+                }
+                if (want_except) {
+                    ++local_ready_count;
+                    if (Arg(3) != 0) {
+                        const u32 word = guest_fd / 32u;
+                        const u32 bit = 1u << (guest_fd % 32u);
+                        memory_.Write32(Arg(3) + word * 4u, memory_.Read32(Arg(3) + word * 4u) | bit);
+                    }
+                }
+                continue;
+            }
+            if (guest_bit(Arg(1), guest_fd)) {
+                FD_SET(handle.socket, &read_set);
+            }
+            if (guest_bit(Arg(2), guest_fd)) {
+                FD_SET(handle.socket, &write_set);
+            }
+            if (guest_bit(Arg(3), guest_fd)) {
+                FD_SET(handle.socket, &except_set);
+            }
+            if (handle.socket >= 0) {
+                max_host_fd = std::max(max_host_fd, static_cast<int>(handle.socket));
+            }
+        }
+
+        timeval timeout{};
+        timeval* timeout_ptr = nullptr;
+        if (Arg(4) != 0) {
+            timeout.tv_sec = static_cast<time_t>(memory_.Read32(Arg(4)));
+            timeout.tv_usec = static_cast<suseconds_t>(memory_.Read32(Arg(4) + 4u));
+            timeout_ptr = &timeout;
+        }
+
+        int ready = local_ready_count;
+        if (max_host_fd >= 0) {
+            const int host_ready = ::select(max_host_fd + 1, &read_set, &write_set, &except_set, timeout_ptr);
+            if (host_ready < 0) {
+                SetErrno(HostSocketErrno());
+                return static_cast<u32>(-1);
+            }
+            ready += host_ready;
+            if (Arg(1) != 0) {
+                const u32 words = static_cast<u32>(std::max<int>(1, (nfds + 31) / 32));
+                for (u32 i = 0; i < words; ++i) {
+                    memory_.Write32(Arg(1) + i * 4u, 0u);
+                }
+                write_guest_bits(Arg(1), read_set);
+            }
+            if (Arg(2) != 0) {
+                const u32 words = static_cast<u32>(std::max<int>(1, (nfds + 31) / 32));
+                for (u32 i = 0; i < words; ++i) {
+                    memory_.Write32(Arg(2) + i * 4u, 0u);
+                }
+                write_guest_bits(Arg(2), write_set);
+            }
+            if (Arg(3) != 0) {
+                const u32 words = static_cast<u32>(std::max<int>(1, (nfds + 31) / 32));
+                for (u32 i = 0; i < words; ++i) {
+                    memory_.Write32(Arg(3) + i * 4u, 0u);
+                }
+                write_guest_bits(Arg(3), except_set);
+            }
+        } else {
+            if (Arg(1) != 0) {
+                const u32 words = static_cast<u32>(std::max<int>(1, (nfds + 31) / 32));
+                for (u32 i = 0; i < words; ++i) {
+                    memory_.Write32(Arg(1) + i * 4u, 0u);
+                }
+            }
+            if (Arg(2) != 0) {
+                const u32 words = static_cast<u32>(std::max<int>(1, (nfds + 31) / 32));
+                for (u32 i = 0; i < words; ++i) {
+                    memory_.Write32(Arg(2) + i * 4u, 0u);
+                }
+            }
+            if (Arg(3) != 0) {
+                const u32 words = static_cast<u32>(std::max<int>(1, (nfds + 31) / 32));
+                for (u32 i = 0; i < words; ++i) {
+                    memory_.Write32(Arg(3) + i * 4u, 0u);
+                }
+            }
+        }
+        return static_cast<u32>(ready);
     }
     if (name == "_qsort") {
         const u32 base = Arg(0);
@@ -8304,9 +8895,38 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
         return 0;
     }
     if (name == "_write") {
+        const auto socket_it = runtime_->sockets.find(Arg(0));
+        if (socket_it != runtime_->sockets.end()) {
+            const auto bytes = memory_.ReadBuffer(Arg(1), Arg(2));
+            const ssize_t written = ::send(socket_it->second.socket,
+                reinterpret_cast<const char*>(bytes.data()),
+                static_cast<int>(bytes.size()),
+                0);
+            if (written < 0) {
+                SetErrno(HostSocketErrno());
+                return static_cast<u32>(-1);
+            }
+            return static_cast<u32>(written);
+        }
         return Arg(2);
     }
     if (name == "_read") {
+        const auto socket_it = runtime_->sockets.find(Arg(0));
+        if (socket_it != runtime_->sockets.end()) {
+            std::vector<u8> data(Arg(2));
+            const ssize_t received = ::recv(socket_it->second.socket,
+                reinterpret_cast<char*>(data.data()),
+                static_cast<int>(data.size()),
+                0);
+            if (received < 0) {
+                SetErrno(HostSocketErrno());
+                return static_cast<u32>(-1);
+            }
+            if (received > 0) {
+                memory_.WriteBuffer(Arg(1), std::span<const u8>(data.data(), static_cast<std::size_t>(received)));
+            }
+            return static_cast<u32>(received);
+        }
         const u32 guest_file = libc_abi_->LookupGuestFileByDescriptor(static_cast<int>(Arg(0)));
         std::FILE* file = libc_abi_->LookupHostFile(guest_file);
         if (file == nullptr) {
@@ -8534,7 +9154,10 @@ u32 Emulator::HandleGenericFunction(const std::string& name) {
     if (name == "_pthread_cond_init" || name == "_pthread_cond_destroy" || name == "_pthread_cond_signal" || name == "_pthread_cond_wait") {
         return 0;
     }
-    if (name == "_pthread_join" || name == "_pthread_mach_thread_np") {
+    if (name == "_pthread_join") {
+        return static_cast<u32>(libc_abi_->PthreadJoin(Arg(0), Arg(1)));
+    }
+    if (name == "_pthread_mach_thread_np") {
         return 0;
     }
     if (name == "_dladdr") {
@@ -12928,13 +13551,16 @@ u32 Emulator::HandleGraphicsFunction(const std::string& name) {
         return 0;
     }
     if (name == "_AudioQueueNewOutput") {
-        // Keep the guest out of the AudioQueue streaming callback path for now. We play
-        // selected music files directly on the Android host side when AudioFileOpenURL sees them.
+        const u32 handle = make_runtime_object("AudioQueue", "AudioQueue");
+        auto& queue = runtime_->audio_queues[handle];
+        queue.callback = Arg(1);
+        queue.callback_user_data = Arg(2);
+        queue.current_path = runtime_->last_music_path;
         if (Arg(6) != 0) {
-            memory_.Write32(Arg(6), 0);
+            memory_.Write32(Arg(6), handle);
         }
-        Log("audio queue disabled callback=" + Hex32(Arg(1)));
-        return 1;
+        Log("audio queue created handle=" + Hex32(handle) + " callback=" + Hex32(Arg(1)));
+        return 0;
     }
     if (name == "_AudioQueueAllocateBuffer") {
         const u32 handle = make_runtime_object("AudioQueueBuffer", "AudioQueueBuffer");
@@ -12971,7 +13597,9 @@ u32 Emulator::HandleGraphicsFunction(const std::string& name) {
         return 0;
     }
     if (name == "_AudioQueuePause") {
-        runtime_->audio_queues[Arg(0)].running = false;
+        auto& queue = runtime_->audio_queues[Arg(0)];
+        queue.running = false;
+        queue.current_path.clear();
         StopHostAudioFile();
         return 0;
     }
@@ -12984,15 +13612,30 @@ u32 Emulator::HandleGraphicsFunction(const std::string& name) {
         return 0;
     }
     if (name == "_AudioQueueStart") {
-        runtime_->audio_queues[Arg(0)].running = true;
-        if (!runtime_->last_music_path.empty()) {
-            const bool ok = PlayHostAudioFile(runtime_->last_music_path);
-            Log(std::string("music start host=") + runtime_->last_music_path.string() + " ok=" + (ok ? "1" : "0"));
+        auto& queue = runtime_->audio_queues[Arg(0)];
+        const bool was_running = queue.running;
+        const auto previous_path = queue.current_path;
+        queue.running = true;
+        auto track_path = queue.current_path.empty() ? runtime_->last_music_path : queue.current_path;
+        if (track_path.empty()) {
+            track_path = runtime_->last_music_path;
+        }
+        if (!track_path.empty()) {
+            if (was_running && previous_path == track_path) {
+                return 0;
+            }
+            queue.current_path = track_path;
+            runtime_->last_music_path = track_path;
+            StopHostAudioFile();
+            const bool ok = PlayHostAudioFile(track_path);
+            Log(std::string("music start host=") + track_path.string() + " ok=" + (ok ? "1" : "0"));
         }
         return 0;
     }
     if (name == "_AudioQueueStop") {
-        runtime_->audio_queues[Arg(0)].running = false;
+        auto& queue = runtime_->audio_queues[Arg(0)];
+        queue.running = false;
+        queue.current_path.clear();
         StopHostAudioFile();
         return 0;
     }
@@ -13097,6 +13740,7 @@ u32 Emulator::HandleGraphicsFunction(const std::string& name) {
             runtime_->last_music_path = file.path;
             Log(name.substr(1) + " guest=" + guest_path + " host=" + file.path.string());
             if (!runtime_->music_autoplay_started && lower_guest_path.find("home_music.mp3") != std::string::npos) {
+                StopHostAudioFile();
                 const bool ok = PlayHostAudioFile(file.path);
                 runtime_->music_autoplay_started = ok;
                 Log(std::string("music autoplay host=") + file.path.string() + " ok=" + (ok ? "1" : "0"));

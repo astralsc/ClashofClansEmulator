@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <mutex>
 
 namespace {
 
@@ -245,11 +246,38 @@ int LibcAbi::PthreadMutexUnlock(const u32 mutex) {
 }
 
 int LibcAbi::PthreadCreate(const u32 out_thread, const u32 /*attr*/, const u32 start_routine, const u32 arg) {
-    if (out_thread == 0) {
+    if (out_thread == 0 || start_routine == 0) {
         return EINVAL;
     }
+
     const u32 thread = CreateThreadObject(start_routine, arg, false);
+    emulator_.memory_.Write32(thread + kThreadOffsetFinished, 0);
+    emulator_.memory_.Write32(thread + kThreadOffsetReturnValue, 0);
+    threads_[thread].finished = false;
+    threads_[thread].return_value = 0;
     emulator_.memory_.Write32(out_thread, thread);
+
+    host_threads_[thread] = std::thread([this, thread, start_routine, arg]() {
+        emulator_.RunGuestThread(start_routine, arg, thread);
+    });
+    return 0;
+}
+
+int LibcAbi::PthreadJoin(const u32 thread, const u32 return_value_ptr) {
+    if (thread == 0) {
+        return EINVAL;
+    }
+    const auto it = host_threads_.find(thread);
+    if (it != host_threads_.end() && it->second.joinable()) {
+        it->second.join();
+    }
+    const auto thread_it = threads_.find(thread);
+    if (thread_it != threads_.end()) {
+        thread_it->second.finished = true;
+        if (return_value_ptr != 0) {
+            emulator_.memory_.Write32(return_value_ptr, thread_it->second.return_value);
+        }
+    }
     return 0;
 }
 

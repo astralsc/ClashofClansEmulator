@@ -238,6 +238,7 @@ private:
     bool BeginTickSlice();
     void RecordHotPcSample();
     void DumpHotPcSamples(std::size_t limit = 16) const;
+    void RunGuestThread(u32 start_routine, u32 arg, u32 thread_id);
 
     u32 DispatchObjCMessage(u32 self, u32 selector, bool is_super, bool stret, u32 stret_buffer);
     u32 HandleGenericFunction(const std::string& name);
@@ -310,6 +311,7 @@ private:
     std::unique_ptr<RuntimeState> runtime_;
     u32 next_gl_name_ = 1;
     u32 next_audio_name_ = 1;
+    std::mutex cpu_execution_mutex_;
     std::unique_ptr<LibcAbi> libc_abi_;
     std::unique_ptr<LibStdCppAbi> libstdcpp_abi_;
     std::unique_ptr<ObjcAbi> objc_abi_;

@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+#include <thread>
+
 class Emulator;
 
 class LibcAbi final {
@@ -27,6 +29,7 @@ public:
     int PthreadMutexLock(u32 mutex);
     int PthreadMutexUnlock(u32 mutex);
     int PthreadCreate(u32 out_thread, u32 attr, u32 start_routine, u32 arg);
+    int PthreadJoin(u32 thread, u32 return_value_ptr);
     u32 MainThread() const;
 
 private:
@@ -96,6 +99,8 @@ private:
     static constexpr u16 kGuestFileFlagErr = 0x0040;
     static constexpr u16 kGuestFileFlagAppend = 0x0100;
 
+    friend class Emulator;
+
     u32 EnsureMainThread();
     u32 CreateThreadObject(u32 start_routine, u32 arg, bool detached);
     MutexState& EnsureMutexState(u32 mutex);
@@ -114,4 +119,5 @@ private:
     int next_synthetic_fd_ = 10000;
     std::unordered_map<u32, MutexState> mutexes_;
     std::unordered_map<u32, ThreadState> threads_;
+    std::unordered_map<u32, std::thread> host_threads_;
 };
